@@ -10,27 +10,34 @@ import com.github.wechat.ilink.sdk.core.model.WeixinMessage;
 import org.example.bot.model.BotMessage;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 /**
  * 微信 iLink 机器人的简化门面。
+ *
+ * <p>消息接收基于 SDK 长轮询 {@code getUpdates()}，Listener 仅用于日志。
  */
 public class ILinkBot {
 
     private final ILinkClient client;
     private LoginContext loginContext;
-    private final ConcurrentLinkedQueue<WeixinMessage> rawQueue;
+    private Consumer<BotMessage> handler;
+    private final ExecutorService handlerExecutor =
+        Executors.newSingleThreadExecutor(r -> new Thread(r, "msg-handler"));
 
-    private ILinkBot(ILinkClient client, ConcurrentLinkedQueue<WeixinMessage> rawQueue) {
+    private ILinkBot(ILinkClient client) {
         this.client = client;
-        this.rawQueue = rawQueue;
+    }
+
+    /** 注册消息处理器 — 每条消息到达时调用（在 handler 线程中执行） */
+    public void setHandler(Consumer<BotMessage> handler) {
+        this.handler = handler;
     }
 
     public static ILinkBot create() {
-        ConcurrentLinkedQueue<WeixinMessage> queue = new ConcurrentLinkedQueue<>();
-
         ILinkConfig config = ILinkConfig.builder()
                 .connectTimeoutMs(35000).readTimeoutMs(35000).writeTimeoutMs(35000)
                 .httpMaxRetries(3).heartbeatEnabled(true).heartbeatIntervalMs(30000)
@@ -46,13 +53,10 @@ public class ILinkBot {
                         System.err.println("[iLink] ❌ 登录失败: " + e.getMessage());
                     }
                 })
-                .onMessage(msgs -> {
-                    System.out.println("[iLink] 📩 收到 " + msgs.size() + " 条消息 → 入队");
-                    queue.addAll(msgs);
-                })
+                .onMessage(msgs -> System.out.println("[iLink] 📩 Listener 通知 " + msgs.size() + " 条"))
                 .build();
 
-        return new ILinkBot(client, queue);
+        return new ILinkBot(client);
     }
 
     public void login() {
@@ -80,54 +84,35 @@ public class ILinkBot {
     }
 
     /**
-     * 从消息队列中拉取并转换为 {@link BotMessage}。
-     *
-     * <p>优先从 {@link OnMessageListener} 推送的内部队列取消息（无竞争），
-     * 队列为空时才调用 {@code getUpdates()} 兜底。
+     * 启动长轮询线程 — SDK 核心消息接收机制。
+     * {@code getUpdates()} 阻塞等待消息（最长 35s 超时），收到后交 handler 处理。
      */
-    public List<BotMessage> pollMessages() {
-        // ① 优先从 Listener 推送的内部队列取消息
-        List<WeixinMessage> rawMessages = new ArrayList<>();
-        WeixinMessage msg;
-        while ((msg = rawQueue.poll()) != null) {
-            rawMessages.add(msg);
-        }
-
-        // ② 队列为空时用 getUpdates 兜底
-        if (rawMessages.isEmpty()) {
-            for (int retry = 0; retry < 2; retry++) {
+    public void startPolling() {
+        Thread poller = new Thread(() -> {
+            System.out.println("[iLink] 🔄 长轮询已启动");
+            while (!Thread.interrupted()) {
                 try {
-                    List<WeixinMessage> fallback = client.getUpdates();
-                    if (fallback != null && !fallback.isEmpty()) {
-                        System.out.println("[iLink] 🔄 getUpdates 兜底收到 " + fallback.size() + " 条");
-                        rawMessages = fallback;
+                    List<WeixinMessage> msgs = client.getUpdates();
+                    if (msgs != null && !msgs.isEmpty()) {
+                        System.out.println("[iLink] 📩 收到 " + msgs.size() + " 条消息");
+                        for (WeixinMessage wm : msgs) {
+                            BotMessage bm = toBotMessage(wm);
+                            if (bm != null && handler != null) {
+                                handlerExecutor.submit(() -> handler.accept(bm));
+                            }
+                        }
                     }
-                    break;
                 } catch (IOException e) {
-                    System.err.println("[iLink] ⚠ 拉取失败(重试" + (retry+1) + "): " + e.getMessage());
-                    if (retry < 1) try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    System.err.println("[iLink] ⚠ getUpdates 异常: " + e.getMessage());
+                    try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
+                } catch (Exception e) {
+                    System.err.println("[iLink] ⚠ 轮询异常: " + e.getMessage());
                 }
             }
-        }
-
-        if (rawMessages.isEmpty()) return List.of();
-
-        List<BotMessage> result = new ArrayList<>();
-        for (WeixinMessage wm : rawMessages) {
-            String userId = wm.getFrom_user_id();
-            if (userId == null) continue;
-            String text = extractText(wm);
-            byte[] image = extractImage(wm);
-            VoiceData vd = extractVoiceData(wm);
-            FileData fd = extractFileData(wm);
-
-            if (fd != null) result.add(BotMessage.file(userId, fd.bytes(), fd.name()));
-            else if (vd != null && (vd.text() != null || vd.audio() != null))
-                result.add(BotMessage.voice(userId, vd.audio() != null ? vd.audio() : new byte[0], vd.text()));
-            else if (image != null) result.add(BotMessage.image(userId, image, text));
-            else if (!text.isEmpty()) result.add(BotMessage.text(userId, text));
-        }
-        return result;
+            System.out.println("[iLink] 🔄 长轮询已停止");
+        }, "ilink-poller");
+        poller.setDaemon(true);
+        poller.start();
     }
 
     // ---- 发送 ----
@@ -161,39 +146,19 @@ public class ILinkBot {
 
     public void close() {
         System.out.println("[iLink] 正在关闭...");
+        handlerExecutor.shutdown();
         client.close();
         System.out.println("[iLink] 已关闭。");
     }
 
-    // ---- 提取 ----
-    private static String extractText(WeixinMessage msg) {
-        List<MessageItem> items = msg.getItem_list();
-        if (items == null || items.isEmpty()) return "";
-        StringBuilder sb = new StringBuilder();
-        for (MessageItem item : items) {
-            if (item.getText_item() != null && item.getText_item().getText() != null) {
-                if (sb.length() > 0) sb.append("\n");
-                sb.append(item.getText_item().getText());
-            }
-        }
-        return sb.toString();
-    }
+    // ---- 消息转换 ----
+    private BotMessage toBotMessage(WeixinMessage wm) {
+        String userId = wm.getFrom_user_id();
+        if (userId == null) return null;
 
-    private byte[] extractImage(WeixinMessage msg) {
-        List<MessageItem> items = msg.getItem_list();
+        List<MessageItem> items = wm.getItem_list();
         if (items == null || items.isEmpty()) return null;
-        for (MessageItem item : items) {
-            if (item.getImage_item() != null && item.getImage_item().getMedia() != null) {
-                try { return client.downloadImageFromMessageItem(item); }
-                catch (IOException e) { System.err.println("[iLink] ⚠ 下载图片失败: " + e.getMessage()); }
-            }
-        }
-        return null;
-    }
 
-    private VoiceData extractVoiceData(WeixinMessage msg) {
-        List<MessageItem> items = msg.getItem_list();
-        if (items == null || items.isEmpty()) return null;
         for (MessageItem item : items) {
             if (item.getVoice_item() != null) {
                 String text = item.getVoice_item().getText();
@@ -202,28 +167,28 @@ public class ILinkBot {
                     try { audio = client.downloadVoiceFromMessageItem(item); }
                     catch (IOException e) { System.err.println("[iLink] ⚠ 下载语音失败: " + e.getMessage()); }
                 }
-                return new VoiceData(audio, text);
+                return BotMessage.voice(userId, audio != null ? audio : new byte[0], text);
             }
-        }
-        return null;
-    }
-
-    private record VoiceData(byte[] audio, String text) {}
-
-    private FileData extractFileData(WeixinMessage msg) {
-        List<MessageItem> items = msg.getItem_list();
-        if (items == null || items.isEmpty()) return null;
-        for (MessageItem item : items) {
+            if (item.getImage_item() != null && item.getImage_item().getMedia() != null) {
+                byte[] image = null;
+                try { image = client.downloadImageFromMessageItem(item); }
+                catch (IOException e) { System.err.println("[iLink] ⚠ 下载图片失败: " + e.getMessage()); }
+                if (image != null) {
+                    String caption = item.getText_item() != null ? item.getText_item().getText() : "";
+                    return BotMessage.image(userId, image, caption != null ? caption : "");
+                }
+            }
             if (item.getFile_item() != null && item.getFile_item().getMedia() != null) {
                 try {
                     byte[] data = client.downloadFileFromMessageItem(item);
                     String name = item.getFile_item().getFile_name();
-                    return new FileData(data, name != null ? name : "file");
+                    return BotMessage.file(userId, data, name != null ? name : "file");
                 } catch (IOException e) { System.err.println("[iLink] ⚠ 下载文件失败: " + e.getMessage()); }
+            }
+            if (item.getText_item() != null && item.getText_item().getText() != null) {
+                return BotMessage.text(userId, item.getText_item().getText());
             }
         }
         return null;
     }
-
-    private record FileData(byte[] bytes, String name) {}
 }

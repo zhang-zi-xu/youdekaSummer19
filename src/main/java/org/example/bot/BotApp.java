@@ -114,85 +114,60 @@ public class BotApp {
         WeatherBotService weather = WeatherBotService.create();
 
         ImageGenService imageGen = null;
-        try {
-            imageGen = new SeedreamImageServiceImpl();
-        } catch (IllegalStateException e) {
-            System.out.println("[Bot] ⚠ 生图服务未启用: " + e.getMessage());
-        }
+        try { imageGen = new SeedreamImageServiceImpl(); }
+        catch (IllegalStateException e) { System.out.println("[Bot] ⚠ 生图服务未启用: " + e.getMessage()); }
 
         VisionService vision = null;
-        try {
-            vision = new DoubaoVisionServiceImpl();
-        } catch (IllegalStateException e) {
-            System.out.println("[Bot] ⚠ 识图服务未启用: " + e.getMessage());
-        }
+        try { vision = new DoubaoVisionServiceImpl(); }
+        catch (IllegalStateException e) { System.out.println("[Bot] ⚠ 识图服务未启用: " + e.getMessage()); }
 
         SpeechService tts = null;
-        try {
-            tts = new QwenTtsSpeechServiceImpl();
-        } catch (IllegalStateException e) {
-            System.out.println("[Bot] ⚠ 语音合成服务未启用: " + e.getMessage());
-        }
+        try { tts = new QwenTtsSpeechServiceImpl(); }
+        catch (IllegalStateException e) { System.out.println("[Bot] ⚠ 语音合成服务未启用: " + e.getMessage()); }
 
-        // 第 3 步：消息收发分离——轮询线程不被回复延迟阻塞
-        java.util.Queue<BotMessage> msgQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
-        Thread poller = new Thread(() -> {
-            while (!Thread.interrupted()) {
-                try {
-                    java.util.List<BotMessage> msgs = bot.pollMessages();
-                    if (!msgs.isEmpty()) {
-                        System.out.println("[Bot] 轮询线程收到 " + msgs.size() + " 条消息入队");
-                        msgQueue.addAll(msgs);
-                    }
-                } catch (Exception e) {
-                    System.err.println("[Bot] ⚠ 轮询异常: " + e.getMessage());
-                    e.printStackTrace();
-                }
+        // ---- 捕获为 final 变量供 lambda 使用 ----
+        final ImageGenService fImageGen = imageGen;
+        final VisionService fVision = vision;
+        final SpeechService fTts = tts;
+        final AiService fAi = ai;
+        final WeatherBotService fWeather = weather;
+
+        // 第 3 步：注册消息处理器 — 每条消息到达时直接处理
+        bot.setHandler(msg -> {
+            String userId = msg.userId();
+
+            if (msg.isVoice()) {
+                System.out.println("[收到] " + userId + " : [语音] "
+                    + (msg.voiceText() != null ? msg.voiceText() : ""));
+                handleVoice(bot, fAi, fTts, fWeather, fVision, fImageGen, msg);
+                return;
             }
-        }, "msg-poller");
-        poller.setDaemon(true);
-        poller.start();
+            if (msg.isImage()) {
+                System.out.println("[收到] " + userId + " : [图片] " + msg.text());
+                handleImage(bot, fAi, fVision, msg);
+                return;
+            }
+            if (msg.isFile()) {
+                System.out.println("[收到] " + userId + " : [文件] " + msg.fileName());
+                handleFile(bot, fAi, userId, msg);
+                return;
+            }
+            // 文字消息
+            String text = msg.text().strip();
+            System.out.println("[收到] " + userId + " : " + text);
+            processTextMessage(bot, fAi, fTts, fWeather, fVision, fImageGen,
+                               userId, text, false);
+        });
 
         System.out.println("\n[Bot] 🟢 开始监听消息...（按 Ctrl+C 退出）\n");
+        bot.startPolling();
 
+        // 主线程阻塞，消息由 handler 线程处理
         try {
-            while (true) {
-                BotMessage msg = msgQueue.poll();
-                if (msg == null) { Thread.sleep(200); continue; }
-                String userId = msg.userId();
-
-                    // --- 语音消息 → AI 处理 → 语音回复 ---
-                    if (msg.isVoice()) {
-                        System.out.println("[收到] " + userId + " : [语音] "
-                            + (msg.voiceText() != null ? msg.voiceText() : ""));
-                        handleVoice(bot, ai, tts, weather, vision, imageGen, msg);
-                        continue;
-                    }
-
-                    // --- 图片消息 → 视觉识别 ---
-                    if (msg.isImage()) {
-                        System.out.println("[收到] " + userId + " : [图片] " + msg.text());
-                        handleImage(bot, ai, vision, msg);
-                        continue;
-                    }
-
-                    // --- 文件消息 → 文件内容提取 + AI 总结 ---
-                    if (msg.isFile()) {
-                        System.out.println("[收到] " + userId + " : [文件] " + msg.fileName());
-                        handleFile(bot, ai, userId, msg);
-                        continue;
-                    }
-
-                    // --- 文字消息 → 统一路由 ---
-                    String text = msg.text().strip();
-                    System.out.println("[收到] " + userId + " : " + text);
-                    processTextMessage(bot, ai, tts, weather, vision, imageGen,
-                                       userId, text, false);
-            }
+            Thread.currentThread().join();
         } catch (InterruptedException e) {
             System.out.println("\n[Bot] 收到退出信号...");
         } finally {
-            poller.interrupt();
             bot.close();
             IMAGE_EXECUTOR.shutdown();
             try { IMAGE_EXECUTOR.awaitTermination(30, TimeUnit.SECONDS); }
