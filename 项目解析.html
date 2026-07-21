@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>微信 AI 聊天机器人 — 项目详解</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --orange: #d2991d; --purple: #a371f7; --red: #f85149;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.7; padding: 2rem; }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.3rem; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.7rem; color: var(--accent); }
+  p, li { color: var(--text); margin: 0.4rem 0; }
+  ul { padding-left: 1.5rem; }
+  .subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 1.5rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin: 1rem 0; }
+  .card h3 { margin-top: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; }
+  th, td { border: 1px solid var(--border); padding: 0.5rem 0.8rem; text-align: left; font-size: 0.9rem; }
+  th { background: #21262d; }
+  code { background: #21262d; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.88rem; }
+  pre { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; margin: 0.8rem 0; }
+  .flow { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1rem 0; font-size: 0.85rem; }
+  .flow .box { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.8rem; }
+  .flow .arrow { color: var(--muted); }
+  .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.78rem; margin-right: 0.3rem; }
+  .tag-green { background: #1a3a2a; color: var(--green); }
+  .tag-orange { background: #3a2e1a; color: var(--orange); }
+  .tag-purple { background: #2a1a3a; color: var(--purple); }
+  .tag-red { background: #3a1a1a; color: var(--red); }
+  .tag-blue { background: #1a2a3a; color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>🤖 微信 AI 聊天机器人</h1>
+<p class="subtitle">基于 wechat-ilink-sdk 的多模态 AI Bot — 架构、流程、实现原理全解</p>
+
+<!-- ====== 概览 ====== -->
+<h2>一、项目概览</h2>
+<div class="card">
+  <table>
+    <tr><th>维度</th><th>内容</th></tr>
+    <tr><td>语言</td><td>Java 21 + Maven</td></tr>
+    <tr><td>微信接入</td><td>wechat-ilink-sdk v2.3.3（长轮询 + AES-ECB 加解密 + CDN 上传下载）</td></tr>
+    <tr><td>AI 对话</td><td>DeepSeek v4-pro（1M token 上下文），通过 OpenAI Java SDK 调用</td></tr>
+    <tr><td>图片生成</td><td>火山引擎 Seedream 5.0 Pro（Ark SDK），异步线程执行</td></tr>
+    <tr><td>图片识别</td><td>火山引擎 Doubao Seed Vision（多模态 Chat API）</td></tr>
+    <tr><td>语音合成</td><td>阿里云百炼 qwen3-tts-flash（DashScope SDK），14 种可切换音色</td></tr>
+    <tr><td>天气查询</td><td>Photon 地理编码 + 和风天气 API</td></tr>
+    <tr><td>文件解析</td><td>Apache PDFBox + Apache POI，支持 TXT/PDF/Word/Excel</td></tr>
+    <tr><td>源文件</td><td>24 个 Java 文件，约 2200 行代码</td></tr>
+  </table>
+</div>
+
+<!-- ====== 架构 ====== -->
+<h2>二、架构设计</h2>
+<p>项目采用<strong>分层 + 接口隔离</strong>架构。每一层只依赖下一层的接口，不依赖具体实现。换 AI / 换识图模型 / 换 TTS 引擎，只需写一个新的实现类，<code>BotApp.java</code> 一行不改。</p>
+
+<pre>
+入口层 BotApp        ← 组装所有组件，启动消息循环
+  ├─ 门面层 ILinkBot  ← 封装 SDK 的 Builder、登录、加解密、CDN
+  └─ 服务层（全是接口）
+       ├─ AiService          → DeepSeekAiServiceImpl
+       ├─ VisionService      → DoubaoVisionServiceImpl
+       ├─ ImageGenService    → SeedreamImageServiceImpl
+       ├─ SpeechService      → QwenTtsSpeechServiceImpl
+       └─ WeatherBotService  → WeatherService
+</pre>
+
+<div class="card">
+  <h3>为什么用接口？</h3>
+  <p>所有 AI 能力都定义成接口，<code>BotApp</code> 只持有接口引用。比如 <code>AiService ai = new DeepSeekAiServiceImpl()</code>，将来换成 <code>new OpenAiServiceImpl()</code>，BotApp 一行不用改。这就是面向接口编程的核心价值：<strong>可插拔、可替换</strong>。</p>
+</div>
+
+<!-- ====== 消息路由 ====== -->
+<h2>三、消息路由 —— 整个 Bot 的心脏</h2>
+<p>所有消息经过一个统一的<strong>优先级路由</strong>。语音修饰符提前检测，后续任意回复都可附加音频输出。</p>
+
+<pre>
+收到消息
+  ├─ 是语音？ ──→ 提取微信预识别文字 → 走文字路由 → TTS 合成 → 发音频
+  ├─ 是图片？ ──→ Vision 识图 → 缓存图片(支持追问) → 记入对话历史
+  ├─ 是文件？ ──→ 提取文本(PDF/Word/Excel/TXT) → AI 总结 → 缓存文档
+  └─ 是文字？
+       ├─ [提前检测] 语音修饰符？ → wantsVoice 标记
+       ├─ 会话命令？ → 新建/切换/删除/查看对话、帮助、人设、音色
+       ├─ 生图意图？ → 关键词粗筛 → AI 精确判断 → 异步 Seedream
+       ├─ 天气意图？ → 关键词粗筛 → AI 精确判断 → 和风天气
+       ├─ 图片追问？ → 有缓存图？ → AI 判断是否追问 → Vision
+       ├─ 文档追问？ → 有缓存文档？ → 关键词命中 → AI 回答
+       └─ AI 自由对话 → wantsVoice 为真则附加 TTS 语音
+</pre>
+
+<div class="card">
+  <h3>两段式意图识别（关键词粗筛 + AI 精确判断）</h3>
+  <p><strong>第 1 段</strong>：用简单关键词过滤，比如"画、生成、来一张"→ 命中才进入第二步。95% 的聊天消息不命中关键词，零额外 API 消耗。</p>
+  <p><strong>第 2 段</strong>：命中的消息发给 DeepSeek，判断"这真的是生图请求吗？要画什么？"。AI 返回 JSON <code>{"isDraw":true,"prompt":"一只猫"}</code>。</p>
+  <p>这解决了纯关键词匹配永远写不完规则的问题——"帮我整一个"、"给我搞张"、"能不能来一张"……中文太灵活了，交给 AI 判断。</p>
+</div>
+
+<!-- ====== 微信 SDK ====== -->
+<h2>四、微信 iLink SDK 原理</h2>
+
+<h3>4.1 登录流程</h3>
+<pre>
+ILinkClient.executeLogin()
+  → GET /api/v2/qrcode → 返回二维码 → 打印到终端
+  → 后台线程轮询 GET /api/v2/qrcode/status
+     waiting → 继续等
+     scanned → 已扫码，等确认
+     logged_in → 拿到 botToken + userId + botId → LoginContext
+     expired → 抛异常 → Bot 自动重新生成二维码（最多 10 次）
+</pre>
+
+<h3>4.2 消息拉取（长轮询）</h3>
+<pre>
+GET /api/v2/updates  （带 cursor 游标）
+  → 服务端阻塞直到有新消息或超时（35 秒 readTimeout）
+  → 返回新消息列表 + 新的 cursor
+  → SDK 把每条消息的 context_token 存入 ContextPoolManager（按 userId 索引）
+  → 下次拉取带新 cursor，实现增量拉取，不会重复接收
+</pre>
+
+<h3>4.3 消息发送</h3>
+<div class="card">
+  <p><strong>发送文字</strong>：从 ContextPoolManager 取出该用户的 contextToken → POST /api/v2/message/send。这就是为什么必须先收到用户消息才能回复——contextToken 来自用户发来的第一条消息。</p>
+  <p><strong>发送图片/文件/语音</strong>：先生成随机 AES Key → AES-ECB-PKCS7 加密 → 向微信申请 CDN 上传凭证 URL → POST 加密数据到 CDN → 发送加密引用 + AES Key 给微信 → 微信从 CDN 取密文 → 用 Key 解密 → 转发给用户。</p>
+  <p><strong>为什么加密？</strong>微信 CDN URL 是公开的。不加密的话任何人拿到 URL 都能下载。客户端在上传前用随机 Key 加密，只有通过消息体里的 Key 才能解密。</p>
+</div>
+
+<h3>4.4 SDK 内部架构（63 个类）</h3>
+<pre>
+ILinkClient（唯一入口，AutoCloseable）
+├── LoginService        — 二维码 → 轮询 → LoginContext
+├── UpdateService       — 长轮询 + cursorStore 增量拉取
+├── MessageService      — 发送文字/图片/语音/文件/视频（含 contextToken）
+├── MediaService        — 加密上传 CDN + 下载解密
+├── TypingService       — "正在输入..." 状态
+├── ContextPoolManager  — 用户 ↔ contextToken 映射
+├── HeartbeatService    — 定时心跳 + 自动重连
+├── ExecutorManager     — IO 线程池 + 调度线程池
+├── RetryPolicy         — 指数退避 + jitter
+└── AesEcbUtil          — AES-ECB-PKCS7 加解密
+</pre>
+
+<!-- ====== 图片生成 ====== -->
+<h2>五、图片生成原理</h2>
+<pre>
+用户: "帮我画一只猫"
+  → 关键词"画"命中 → AI 判断 {isDraw:true, prompt:"一只猫"}
+  → 异步线程提交到 IMAGE_EXECUTOR（单线程池）
+  → POST ark.cn-beijing.volces.com/api/v3
+     model: doubao-seedream-5-0-pro-260628
+     prompt: "一只猫", size: 1K, format: png, responseFormat: URL
+  → 火山引擎返回临时图片 URL
+  → HttpClient GET 下载图片 → byte[]
+  → ILinkBot.sendImage() → AES 加密 → 上传 CDN → 发送
+  → 主线程立即返回继续处理消息（不阻塞）
+</pre>
+<p><strong>为什么异步</strong>：生图耗时 10~30 秒。如果同步执行会卡住整个消息循环，期间用户发的任何消息都无法被拉取。改为异步后，主线程立即返回继续 poll 新消息。</p>
+<p><strong>Seedream 模型原理</strong>：文生图扩散模型。prompt → 文本编码成向量 → 初始化纯噪声图 → 迭代去噪（每步参考文本向量引导图像方向）→ 几十步后噪声图变成一只猫。</p>
+
+<!-- ====== 图片识别 ====== -->
+<h2>六、图片识别 + 追问原理</h2>
+<pre>
+用户发送图片
+  → SDK: downloadImageFromMessageItem() → GET CDN → AES 解密 → byte[]
+  → Base64 编码 → "data:image/jpeg;base64,/9j/4AAQ..."
+  → POST 多模态 Chat API
+     content: [{type:"image_url", image_url:{url:"data:..."}},
+               {type:"text", text:"请描述这张图片"}]
+     model: doubao-seed-2-0-lite-260215
+  → 返回文字描述 → 缓存图片 byte[]（5 分钟）
+  → 用户追问"照片里有人吗" → 缓存图 + 新问题 → Vision API
+</pre>
+<p><strong>为什么用 Base64</strong>：HTTP JSON 不能直接传输二进制。Base64 把任意字节映射到 64 个可打印 ASCII 字符。代价：体积膨胀 33%。</p>
+<p><strong>为什么缓存图片</strong>：微信不支持图文混发——用户发图时不能附带文字 prompt。缓存解决这个问题，让用户可以先发图再问。</p>
+
+<!-- ====== 语音 ====== -->
+<h2>七、语音对话原理</h2>
+
+<h3>7.1 语音输入（零 API 消耗）</h3>
+<p>微信的 <code>VoiceItem.text</code> 字段自带语音识别结果——微信服务端已做好 ASR。下载语音字节只是为了支持后续的音色克隆等场景，日常对话只用 text 字段。</p>
+
+<h3>7.2 TTS 选型过程</h3>
+<table>
+  <tr><th>方案</th><th>协议</th><th>复杂度</th><th>结论</th></tr>
+  <tr><td>火山引擎豆包 TTS</td><td>WebSocket + 自定义二进制帧协议（4字节头、大端序、位操作、状态机）</td><td>最高</td><td>❌</td></tr>
+  <tr><td>阿里云智能语音交互</td><td>AK+SK→Token→WebSocket</td><td>高</td><td>❌</td></tr>
+  <tr><td>阿里百炼 Qwen-TTS 实时</td><td>WebSocket + JSON</td><td>中</td><td>❌</td></tr>
+  <tr><td><strong>阿里百炼 qwen3-tts-flash</strong></td><td><strong>HTTP → 音频 URL → 下载</strong></td><td><strong>最低</strong></td><td>✅</td></tr>
+</table>
+
+<h3>7.3 语音气泡失败</h3>
+<p>尝试了手动解析 WAV 二进制头、Java AudioSystem 提取 PCM、指定 encodeType=4——SDK 不报错但微信端不显示。结论：微信语音气泡只接受 AMR/SILK 编码，Java 生态无可用编码器。降级为文件方式发送。</p>
+
+<h3>7.4 语音模式 vs 语音修饰符</h3>
+<p><strong>语音修饰符</strong>：在消息处理开头检测语音意图，存成 <code>wantsVoice</code> 标志。后续天气/AI 对话产生文字回复后，检查标志决定是否附加音频。这样"用语音说一下杭州天气"能同时触发天气查询和语音输出。</p>
+<p><strong>语音模式</strong>：在 <code>SessionManager</code> 中按用户保存布尔标记。开启后所有回复自动附带音频，无需每次说"发语音"。</p>
+
+<!-- ====== 多会话 ====== -->
+<h2>八、多会话管理原理</h2>
+<pre>
+SessionManager
+  ├─ Map&lt;userId, Map&lt;sessionName, Session&gt;&gt;  — 每个用户多个会话
+  ├─ Map&lt;userId, String&gt; currentSession      — 当前活跃会话名
+  └─ Map&lt;userId, Boolean&gt; voiceMode          — 语音模式开关
+
+Session
+  ├─ String persona       — 当前人设（可独立修改）
+  ├─ List&lt;String&gt; roles   — ["user","assistant","user",...]
+  └─ List&lt;String&gt; contents — 对应的消息内容（最多 200 条 = 100 轮）
+</pre>
+<p><strong>人设分离</strong>：每个会话的 <code>persona</code> 可独立修改，但 <code>TECH_INSTRUCTIONS</code>（"你有语音回复能力，不要说你不能发语音..."）始终追加到所有会话的 system prompt 末尾。这样人设随便玩，语音能力不会"丢失"。</p>
+
+<!-- ====== 文件处理 ====== -->
+<h2>九、文件处理原理</h2>
+<pre>
+收发文件
+  → SDK downloadFileFromMessageItem() → AES 解密 → byte[]
+  → 尝试 UTF-8 / GBK / GB2312 读取（检测乱码率 < 5%）
+  → 失败？→ 尝试 PDFBox 提取 PDF 文本
+  → 失败？→ 尝试 POI 提取 Word 文本
+  → 失败？→ 尝试 POI 提取 Excel 文本
+  → 都失败 → 提示不支持
+  → 成功 → 截断到 8000 字 → AI 总结 → 缓存文档（支持追问）
+</pre>
+
+<!-- ====== 技术决策 ====== -->
+<h2>十、关键技术决策</h2>
+
+<div class="card">
+  <h3>决策 1：为什么 DeepSeek 用 OpenAI SDK？</h3>
+  <p>DeepSeek API 完全兼容 OpenAI 接口格式。用 OpenAI Java SDK 只需把 baseUrl 指向 <code>api.deepseek.com/v1</code>，不用自己拼 JSON、处理重试。代码从 200 行手动拼接缩减到 20 行。</p>
+</div>
+
+<div class="card">
+  <h3>决策 2：为什么天气用 Photon 而不是 Open-Meteo？</h3>
+  <p>Open-Meteo（GeoNames 后端）对中文城市覆盖率不够。"宿迁"、"周口"等地级市搜不到。Photon 基于 OpenStreetMap，对中国城市的覆盖远好，且免费无需 Key。</p>
+</div>
+
+<div class="card">
+  <h3>决策 3：为什么不支持语音气泡？</h3>
+  <p>微信语音气泡需要 AMR 或 SILK 编码。SDK 的 <code>sendVoice</code> 只负责加密上传，不做转码。TTS 输出 WAV/MP3，和 AMR 不兼容。Java 生态无成熟的 SILK 编码库。产品上接受降级——发音频文件，点开播放。</p>
+</div>
+
+<div class="card">
+  <h3>决策 4：为什么消息收发分离到不同线程？</h3>
+  <p>最初是单线程——<code>pollMessages → 处理 → sendReply → sleep → pollMessages</code>。生图/TTS/API 调用耗时几秒到几十秒，期间完全无法接收新消息。改为轮询线程独立运行后，主线程处理消息的同时轮询线程持续拉取，消息永不丢失。</p>
+</div>
+
+<!-- ====== 文件结构 ====== -->
+<h2>十一、源码文件结构（24 个文件）</h2>
+<pre>
+src/main/java/
+├── org/example/bot/
+│   ├── BotApp.java                      ← 主入口 + 消息路由（~600行）
+│   ├── ilink/ILinkBot.java              ← 微信 SDK 门面
+│   ├── model/
+│   │   ├── BotMessage.java              ← 消息载体（文字/图片/语音/文件）
+│   │   ├── DrawIntent.java              ← 生图意图提取结果
+│   │   ├── ImageFollowUpIntent.java     ← 图片追问意图
+│   │   ├── WeatherIntent.java           ← 天气意图
+│   │   ├── VoiceReplyIntent.java        ← 语音回复意图
+│   │   └── SessionCommandIntent.java    ← 会话命令意图
+│   ├── service/                         ← 服务接口（可插拔）
+│   │   ├── AiService.java
+│   │   ├── VisionService.java
+│   │   ├── ImageGenService.java
+│   │   ├── SpeechService.java
+│   │   └── WeatherBotService.java
+│   ├── impl/                            ← 服务实现
+│   │   ├── DeepSeekAiServiceImpl.java   ← AI 对话 + 意图识别
+│   │   ├── DoubaoVisionServiceImpl.java ← 图片识别
+│   │   ├── SeedreamImageServiceImpl.java← 图片生成
+│   │   ├── QwenTtsSpeechServiceImpl.java← 语音合成 + 音色管理
+│   │   ├── SessionManager.java          ← 多会话管理器
+│   │   └── Session.java                 ← 单个会话
+│   └── util/ConfigUtil.java             ← 配置读取
+│
+└── com/weather/                         ← 天气模块（独立）
+    ├── WeatherApp.java
+    ├── service/WeatherService.java       ← Photon + 和风天气
+    ├── model/WeatherData.java
+    └── exception/WeatherException.java
+</pre>
+
+</div>
+</body>
+</html>
