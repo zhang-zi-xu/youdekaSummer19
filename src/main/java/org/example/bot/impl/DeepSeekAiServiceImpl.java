@@ -139,9 +139,15 @@ public class DeepSeekAiServiceImpl implements AiService {
             ChatCompletionMessageFunctionToolCall funcCall = toolCall.asFunction();
             String funcName = funcCall.function().name();
             String arguments = funcCall.function().arguments();
+            String toolCallId = funcCall.id();
             System.out.println("[FC] AI 调用工具: " + funcName + "(" + arguments + ")");
 
-            JsonObject args = gson.fromJson(arguments, JsonObject.class);
+            if (funcName == null || toolCallId == null) {
+                System.err.println("[FC] ⚠ 工具调用缺少 name 或 id，降级到自由对话");
+                return null;
+            }
+
+            JsonObject args = gson.fromJson(arguments != null ? arguments : "{}", JsonObject.class);
             java.util.function.Function<JsonObject, String> executor = executors.get(funcName);
             String toolResult = executor != null
                 ? executor.apply(args)
@@ -159,11 +165,12 @@ public class DeepSeekAiServiceImpl implements AiService {
                 }
             }
             followUp.addUserMessage(userMessage);
+            // 只包含本次执行的 tool_call（与 tool 消息一一对应）
             followUp.addMessage(ChatCompletionAssistantMessageParam.builder()
-                    .toolCalls(message.toolCalls().orElse(List.of()))
+                    .toolCalls(List.of(toolCall))
                     .build());
             followUp.addMessage(ChatCompletionToolMessageParam.builder()
-                    .toolCallId(funcCall.id())
+                    .toolCallId(toolCallId)
                     .content(toolResult)
                     .build());
 
@@ -176,6 +183,7 @@ public class DeepSeekAiServiceImpl implements AiService {
 
         } catch (Exception e) {
             System.err.println("[AI] ❌ Function Calling 失败: " + e.getMessage());
+            e.printStackTrace();
             return null;
         }
     }
