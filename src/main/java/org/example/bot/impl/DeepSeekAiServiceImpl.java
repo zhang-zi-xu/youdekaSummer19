@@ -99,6 +99,8 @@ public class DeepSeekAiServiceImpl implements AiService {
 
     // ---- 统一 Function Calling ----
 
+    private static final int MAX_FC_ROUNDS = 5; // 最多工具调用轮次，防止无限循环
+
     @Override
     public String chatWithTools(String userId, String userMessage,
                                 List<FunctionDefinition> tools,
@@ -125,65 +127,63 @@ public class DeepSeekAiServiceImpl implements AiService {
             }
 
             builder.model(MODEL);
-            ChatCompletion completion = client.chat().completions().create(builder.build());
-            ChatCompletionMessage message = completion.choices().get(0).message();
+            ChatCompletionMessage message = client.chat().completions()
+                    .create(builder.build()).choices().get(0).message();
 
-            // 步骤 2: AI 是否选择调用工具？
-            List<ChatCompletionMessageToolCall> toolCalls = message.toolCalls().orElse(List.of());
-            if (toolCalls.isEmpty()) {
-                return null; // AI 没选工具 → 降级到自由对话
-            }
+            // 步骤 2: 循环 — AI 可能连续调用多轮工具
+            for (int round = 0; round < MAX_FC_ROUNDS; round++) {
+                List<ChatCompletionMessageToolCall> toolCalls =
+                    message.toolCalls().orElse(List.of());
 
-            // 步骤 3: 执行工具
-            ChatCompletionMessageToolCall toolCall = toolCalls.get(0);
-            ChatCompletionMessageFunctionToolCall funcCall = toolCall.asFunction();
-            String funcName = funcCall.function().name();
-            String arguments = funcCall.function().arguments();
-            String toolCallId = funcCall.id();
-            System.out.println("[FC] AI 调用工具: " + funcName + "(" + arguments + ")");
-
-            if (funcName == null || toolCallId == null) {
-                System.err.println("[FC] ⚠ 工具调用缺少 name 或 id，降级到自由对话");
-                return null;
-            }
-
-            JsonObject args = gson.fromJson(arguments != null ? arguments : "{}", JsonObject.class);
-            java.util.function.Function<JsonObject, String> executor = executors.get(funcName);
-            String toolResult = executor != null
-                ? executor.apply(args)
-                : "工具 " + funcName + " 未注册执行器";
-
-            // 步骤 4: 工具结果发回 AI → 获取自然语言回复
-            ChatCompletionCreateParams.Builder followUp = ChatCompletionCreateParams.builder()
-                    .addSystemMessage(sessionManager.fullSystemPrompt(session));
-
-            for (int i = 0; i < session.roles.size() - 1; i++) {
-                if ("user".equals(session.roles.get(i))) {
-                    followUp.addUserMessage(session.contents.get(i));
-                } else {
-                    followUp.addAssistantMessage(session.contents.get(i));
+                // 没有工具调用了 → 返回最终文本回复
+                if (toolCalls.isEmpty()) {
+                    String reply = message.content().orElse("");
+                    if (!reply.isBlank()) {
+                        session.add("assistant", reply);
+                        return reply;
+                    }
+                    return null; // 第一轮就没有 tool_call 也没内容 → 降级
                 }
+
+                // 记录 assistant 的 tool_calls 到对话
+                builder.addMessage(ChatCompletionAssistantMessageParam.builder()
+                        .toolCalls(message.toolCalls().orElse(List.of()))
+                        .build());
+
+                // 执行本轮所有工具
+                for (ChatCompletionMessageToolCall tc : toolCalls) {
+                    ChatCompletionMessageFunctionToolCall funcCall = tc.asFunction();
+                    String funcName = funcCall.function().name();
+                    String arguments = funcCall.function().arguments();
+                    System.out.println("[FC] AI 调用工具: " + funcName + "(" + arguments + ")");
+
+                    JsonObject args = gson.fromJson(
+                        arguments != null ? arguments : "{}", JsonObject.class);
+                    java.util.function.Function<JsonObject, String> executor =
+                        executors.get(funcName);
+                    String result = executor != null
+                        ? executor.apply(args)
+                        : "工具 " + funcName + " 未注册执行器";
+
+                    builder.addMessage(ChatCompletionToolMessageParam.builder()
+                            .toolCallId(funcCall.id())
+                            .content(result)
+                            .build());
+                }
+
+                // 继续对话 — AI 可能再调工具或返回最终文本
+                builder.model(MODEL);
+                message = client.chat().completions().create(builder.build())
+                        .choices().get(0).message();
             }
-            followUp.addUserMessage(userMessage);
-            // 只包含本次执行的 tool_call（与 tool 消息一一对应）
-            followUp.addMessage(ChatCompletionAssistantMessageParam.builder()
-                    .toolCalls(List.of(toolCall))
-                    .build());
-            followUp.addMessage(ChatCompletionToolMessageParam.builder()
-                    .toolCallId(toolCallId)
-                    .content(toolResult)
-                    .build());
 
-            followUp.model(MODEL);
-            ChatCompletion finalCompletion = client.chat().completions().create(followUp.build());
-            String finalReply = finalCompletion.choices().get(0).message().content().orElse("");
-
-            session.add("assistant", finalReply);
-            return finalReply;
+            // 超过最大轮次 — 返回最后一条消息（不含 tool_calls 的）
+            String reply = message.content().orElse("抱歉，处理超时，请简化你的请求。");
+            session.add("assistant", reply);
+            return reply;
 
         } catch (Exception e) {
             System.err.println("[AI] ❌ Function Calling 失败: " + e.getMessage());
-            e.printStackTrace();
             return null;
         }
     }

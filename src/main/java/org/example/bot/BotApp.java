@@ -11,8 +11,6 @@ import org.example.bot.impl.DeepSeekAiServiceImpl;
 import org.example.bot.impl.DoubaoVisionServiceImpl;
 import org.example.bot.impl.QwenTtsSpeechServiceImpl;
 import org.example.bot.impl.SeedreamImageServiceImpl;
-import org.example.bot.impl.SimpleNewsServiceImpl;
-import org.example.bot.service.NewsService;
 
 import com.openai.core.JsonValue;
 import com.openai.models.FunctionDefinition;
@@ -46,9 +44,7 @@ public class BotApp {
     /** 技术指令（不随人设变化，始终追加） */
     private static final String TECH_INSTRUCTIONS =
         "你有语音回复能力，用户要求语音时你的文字会自动转语音，所以不要说你不能发语音。" +
-        "回复简洁自然，适合朗读。" +
-        "你可以查询天气、获取新闻、生成图片、识别图片、总结文件等。" +
-        "当用户问新闻相关问题时，直接调用 get_news 工具获取真实新闻，不要说你没有联网功能。";
+        "回复简洁自然，适合朗读。";
 
     /** 生图专用线程池 — 避免阻塞主消息循环 */
     private static final ExecutorService IMAGE_EXECUTOR =
@@ -64,9 +60,6 @@ public class BotApp {
 
     /** 上一份文档缓存 — 支持追问 */
     private static final Map<String, CachedDoc> LAST_DOC = new HashMap<>(); // 5 分钟
-
-    /** 上一次新闻缓存 — 支持"第X条详细说说" */
-    private static final Map<String, CachedNews> LAST_NEWS = new HashMap<>();
 
     private static class CachedImage {
         final byte[] bytes;
@@ -86,19 +79,6 @@ public class BotApp {
         final long timestamp;
         CachedDoc(String content, String fileName) {
             this.content = content; this.fileName = fileName;
-            this.timestamp = System.currentTimeMillis();
-        }
-        boolean expired() { return System.currentTimeMillis() - timestamp > IMAGE_CACHE_TTL_MS; }
-    }
-
-    /** 缓存的新闻条目 */
-    private record NewsItem(String title, String desc, String link) {}
-
-    private static class CachedNews {
-        final java.util.List<NewsItem> items;
-        final long timestamp;
-        CachedNews(java.util.List<NewsItem> items) {
-            this.items = items;
             this.timestamp = System.currentTimeMillis();
         }
         boolean expired() { return System.currentTimeMillis() - timestamp > IMAGE_CACHE_TTL_MS; }
@@ -146,16 +126,12 @@ public class BotApp {
         try { tts = new QwenTtsSpeechServiceImpl(); }
         catch (IllegalStateException e) { System.out.println("[Bot] ⚠ 语音合成服务未启用: " + e.getMessage()); }
 
-        NewsService news = new SimpleNewsServiceImpl();
-        System.out.println("[Bot] 📰 新闻服务已就绪");
-
         // ---- 捕获为 final 变量供 lambda 使用 ----
         final ImageGenService fImageGen = imageGen;
         final VisionService fVision = vision;
         final SpeechService fTts = tts;
         final AiService fAi = ai;
         final WeatherBotService fWeather = weather;
-        final NewsService fNews = news;
 
         // 第 3 步：注册消息处理器 — 每条消息到达时直接处理
         bot.setHandler(msg -> {
@@ -164,7 +140,7 @@ public class BotApp {
             if (msg.isVoice()) {
                 System.out.println("[收到] " + userId + " : [语音] "
                     + (msg.voiceText() != null ? msg.voiceText() : ""));
-                handleVoice(bot, fAi, fTts, fWeather, fVision, fImageGen, fNews, msg);
+                handleVoice(bot, fAi, fTts, fWeather, fVision, fImageGen, msg);
                 return;
             }
             if (msg.isImage()) {
@@ -180,7 +156,7 @@ public class BotApp {
             // 文字消息
             String text = msg.text().strip();
             System.out.println("[收到] " + userId + " : " + text);
-            processTextMessage(bot, fAi, fTts, fWeather, fVision, fImageGen, fNews,
+            processTextMessage(bot, fAi, fTts, fWeather, fVision, fImageGen,
                                userId, text, false);
         });
 
@@ -213,7 +189,7 @@ public class BotApp {
      */
     private static void processTextMessage(ILinkBot bot, AiService ai, SpeechService tts,
                                            WeatherBotService weather, VisionService vision,
-                                           ImageGenService imageGen, NewsService news,
+                                           ImageGenService imageGen,
                                            String userId, String text, boolean forceVoice) {
         // ① 本地命令 — 精确/前缀匹配，零 API 消耗
         if (tryHandleLocalCommand(bot, ai, tts, userId, text)) return;
@@ -227,7 +203,7 @@ public class BotApp {
         java.util.List<FunctionDefinition> tools = new java.util.ArrayList<>();
         java.util.Map<String, java.util.function.Function<JsonObject, String>> executors
             = new java.util.LinkedHashMap<>();
-        buildTools(tools, executors, bot, ai, weather, vision, imageGen, news, userId);
+        buildTools(tools, executors, bot, ai, weather, vision, imageGen, userId);
 
         // ④ 统一 Function Calling — 一次 API 调用，AI 自主决定用哪个工具
         if (!tools.isEmpty()) {
@@ -315,7 +291,7 @@ public class BotApp {
             java.util.Map<String, java.util.function.Function<JsonObject, String>> executors,
             ILinkBot bot, AiService ai,
             WeatherBotService weather, VisionService vision,
-            ImageGenService imageGen, NewsService news, String userId) {
+            ImageGenService imageGen, String userId) {
 
         // --- 天气查询（始终可用）---
         tools.add(functionDef("get_weather",
@@ -323,42 +299,9 @@ public class BotApp {
             "当用户询问天气、气温、会不会下雨、冷不冷、热不热、穿什么衣服等问题时调用此工具。",
             Map.of("city", Map.of("type", "string", "description", "城市名称，例如：北京、上海、东京"))));
         executors.put("get_weather", args -> {
-            String city = "";
-            try { if (args.has("city") && !args.get("city").isJsonNull()) city = args.get("city").getAsString(); } catch (Exception ignored) {}
-            if (city.isBlank()) city = "北京";
+            String city = args.has("city") ? args.get("city").getAsString() : "";
             return weather != null ? weather.query(city) : "天气服务未配置";
         });
-
-        // --- 新闻获取（始终可用）---
-        tools.add(functionDef("get_news",
-            "获取最新新闻。用户询问任何新闻、热点、时事、最新消息时调用此工具。" +
-            "即使用户问「你能查新闻吗」「有什么新闻」等关于新闻能力的问题，也调用此工具来展示实际新闻。" +
-            "类别可选：综合、科技、财经、体育、娱乐。",
-            Map.of("category", Map.of("type", "string",
-                "description", "新闻类别。用户提到具体类别时传入，否则传「综合」。"))));
-        executors.put("get_news", args -> {
-            String category = "综合";
-            try { if (args.has("category") && !args.get("category").isJsonNull()) category = args.get("category").getAsString(); } catch (Exception ignored) {}
-            return news.getNews(category, 8);
-        });
-
-        // --- 新闻详情（条件：刚查过新闻）---
-        if (news.isAvailable()) {
-            tools.add(functionDef("read_news_article",
-                "用户想了解某条新闻的详细内容。用户说「第X条」「某标题详细说说」「安切洛蒂那条」等时调用。" +
-                "传入新闻标题中的关键词即可，不要编造序号。工具只返回标题和摘要，没有全文。禁止编造正文。",
-                Map.of("query", Map.of("type", "string",
-                    "description", "新闻标题关键词，例如「女排」「安切洛蒂」。不要传序号。"))));
-            executors.put("read_news_article", args -> {
-                String query = "";
-                try { if (args.has("query") && !args.get("query").isJsonNull()) query = args.get("query").getAsString(); } catch (Exception ignored) {}
-                // 兼容：如果 AI 还是传了 index 参数
-                if (query.isBlank() && args.has("index") && !args.get("index").isJsonNull()) {
-                    try { return news.getArticleDetail(args.get("index").getAsInt()); } catch (Exception ignored) {}
-                }
-                return ((SimpleNewsServiceImpl) news).findArticle(query);
-            });
-        }
 
         // --- 图片生成（如果服务可用）---
         if (imageGen != null) {
@@ -366,8 +309,7 @@ public class BotApp {
                 "根据文字描述生成一张图片。当用户说「画」「生成」「来一张」「做一张」「帮我画」等时调用。",
                 Map.of("prompt", Map.of("type", "string", "description", "图片的详细描述，例如：一只在屋顶看星星的橘猫"))));
             executors.put("generate_image", args -> {
-                String prompt = "";
-                try { if (args.has("prompt") && !args.get("prompt").isJsonNull()) prompt = args.get("prompt").getAsString(); } catch (Exception ignored) {}
+                String prompt = args.has("prompt") ? args.get("prompt").getAsString() : "";
                 if (prompt.isBlank()) return "用户没有提供图片描述";
                 // 异步生图 — 不阻塞当前回复
                 final String p = prompt;
@@ -403,7 +345,7 @@ public class BotApp {
             "切换到指定的已有对话。用户说「切换到」「切换对话」「回到」等时调用。",
             Map.of("name", Map.of("type", "string", "description", "要切换到的对话名称"))));
         executors.put("switch_session", args -> {
-            String name = args.has("name") && !args.get("name").isJsonNull() ? args.get("name").getAsString() : "";
+            String name = args.has("name") ? args.get("name").getAsString() : "";
             sm.switchTo(userId, name);
             return "✅ 已切换到对话「" + name + "」。";
         });
@@ -412,7 +354,7 @@ public class BotApp {
             "删除指定的对话会话。用户说「删掉」「删除对话」「移除」等时调用。",
             Map.of("name", Map.of("type", "string", "description", "要删除的对话名称"))));
         executors.put("delete_session", args -> {
-            String name = args.has("name") && !args.get("name").isJsonNull() ? args.get("name").getAsString() : "";
+            String name = args.has("name") ? args.get("name").getAsString() : "";
             return sm.deleteSession(userId, name);
         });
 
@@ -629,8 +571,7 @@ public class BotApp {
 
     private static void handleVoice(ILinkBot bot, AiService ai, SpeechService tts,
                                      WeatherBotService weather, VisionService vision,
-                                     ImageGenService imageGen, NewsService news,
-                                     BotMessage msg) {
+                                     ImageGenService imageGen, BotMessage msg) {
         String userId = msg.userId();
         String text = msg.voiceText();
         if (text == null || text.isBlank()) {
@@ -640,7 +581,7 @@ public class BotApp {
 
         System.out.println("[Bot] 🎤 语音识别: " + text);
         // 统一走文字路由，forceVoice=true 确保回复一定带语音
-        processTextMessage(bot, ai, tts, weather, vision, imageGen, news, userId, text, true);
+        processTextMessage(bot, ai, tts, weather, vision, imageGen, userId, text, true);
     }
 
     // ---- 工具方法 ----

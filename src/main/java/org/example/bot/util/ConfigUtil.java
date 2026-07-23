@@ -39,11 +39,9 @@ public final class ConfigUtil {
         }
 
         // 2. 环境变量
-        if (envKey != null) {
-            value = System.getenv(envKey);
-            if (value != null && !value.isBlank()) {
-                return value.strip();
-            }
+        value = System.getenv(envKey);
+        if (value != null && !value.isBlank()) {
+            return value.strip();
         }
 
         // 3. config.properties
